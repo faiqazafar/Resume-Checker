@@ -1,14 +1,22 @@
 import os
 import json
 import re
-
+import time
+ 
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document
-from google import genai
-from google.genai import types
-
-
+ 
+try:
+    from google import genai
+    from google.genai import types
+    _GENAI_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover
+    genai = None
+    types = None
+    _GENAI_IMPORT_ERROR = str(_e)
+ 
+ 
 # -----------------------------
 # Page setup
 # -----------------------------
@@ -17,13 +25,23 @@ st.set_page_config(
     page_icon="📄",
     layout="wide",
 )
-
+ 
 st.title("📄 AI Resume ATS Checker")
 st.write(
     "Upload your resume and optionally add a job description. "
     "The app will estimate an ATS score and suggest practical improvements."
 )
-
+ 
+if _GENAI_IMPORT_ERROR:
+    st.error(
+        "The Gemini SDK (google-genai) failed to load in this environment: "
+        f"{_GENAI_IMPORT_ERROR}\n\n"
+        "This usually means the deployed environment's installed packages are out of "
+        "date or stale. On Streamlit Community Cloud, try Settings → Reboot app "
+        "(or redeploy from scratch) so requirements.txt is reinstalled cleanly."
+    )
+    st.stop()
+ 
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -35,65 +53,65 @@ def get_api_key():
             return key
     except Exception:
         pass
-
+ 
     return os.getenv("GEMINI_API_KEY")
-
-
+ 
+ 
 def extract_pdf_text(uploaded_file):
     """Extract text from a PDF."""
     reader = PdfReader(uploaded_file)
     pages = []
-
+ 
     for page in reader.pages:
         text = page.extract_text() or ""
         pages.append(text)
-
+ 
     return "\n".join(pages).strip()
-
-
+ 
+ 
 def extract_docx_text(uploaded_file):
     """Extract text from a DOCX file."""
     document = Document(uploaded_file)
-
+ 
     paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
-
+ 
     # Also read text from tables because some resumes use tables.
     for table in document.tables:
         for row in table.rows:
             for cell in row.cells:
                 if cell.text.strip():
                     paragraphs.append(cell.text.strip())
-
+ 
     return "\n".join(paragraphs).strip()
-
-
+ 
+ 
 def extract_resume_text(uploaded_file):
     """Extract text according to the uploaded file type."""
     file_name = uploaded_file.name.lower()
-
+ 
     if file_name.endswith(".pdf"):
         return extract_pdf_text(uploaded_file)
-
+ 
     if file_name.endswith(".docx"):
         return extract_docx_text(uploaded_file)
-
+ 
     raise ValueError("Only PDF and DOCX files are supported.")
-
-
+ 
+ 
 def clean_score(value):
     """Keep a score between 0 and 100."""
     try:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return 0
-
-
+ 
+ 
 # -----------------------------
 # Gemini configuration
 # -----------------------------
 # Keep the model in one place so it can easily be changed later.
 MODEL_NAME = "gemini-3.6-flash"
-
+ 
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -161,20 +179,20 @@ RESULT_SCHEMA = {
         "formatting_warnings"
     ]
 }
-
-
+ 
+ 
 def analyze_resume(resume_text, job_description):
     """Send the resume to Gemini and return structured ATS feedback."""
     api_key = get_api_key()
-
+ 
     if not api_key:
         raise ValueError(
             "Gemini API key was not found. Add GEMINI_API_KEY to "
             "Streamlit Secrets or your environment variables."
         )
-
+ 
     client = genai.Client(api_key=api_key)
-
+ 
     if job_description.strip():
         job_text = job_description.strip()
     else:
@@ -183,12 +201,12 @@ def analyze_resume(resume_text, job_description):
             "general ATS-friendly resume standards and identify broadly "
             "useful skills/keywords."
         )
-
+ 
     prompt = f"""
 You are an ATS resume evaluator.
-
+ 
 Analyze the resume below.
-
+ 
 IMPORTANT:
 1. Give an ATS-style score from 0 to 100.
 2. Do not claim that your score is the exact score of a real ATS. It is an estimate.
@@ -208,30 +226,61 @@ IMPORTANT:
    - poor readability
 8. Make the improvements specific and actionable.
 9. Return only the requested structured JSON.
-
+ 
 JOB DESCRIPTION:
 {job_text}
-
+ 
 RESUME:
 {resume_text}
 """
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=RESULT_SCHEMA,
-            temperature=0.2,
-        ),
-    )
-
+ 
+    response = _call_gemini_with_retry(client, prompt)
+ 
     if not response.text:
         raise ValueError("Gemini returned an empty response.")
-
+ 
     return json.loads(response.text)
-
-
+ 
+ 
+def _call_gemini_with_retry(client, prompt, max_attempts=3):
+    """
+    Call Gemini with automatic retry for transient server-side errors
+    (e.g. 503 UNAVAILABLE during high demand). Waits briefly and longer
+    between attempts, then gives up with a clear message.
+    """
+    last_error = None
+ 
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=RESULT_SCHEMA,
+                    temperature=0.2,
+                ),
+            )
+        except Exception as e:
+            last_error = e
+            # Only retry on errors that look transient/server-side (503, 429,
+            # UNAVAILABLE, RESOURCE_EXHAUSTED). Anything else (bad API key,
+            # invalid request) should fail immediately instead of retrying.
+            message = str(e)
+            transient = any(
+                marker in message
+                for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded")
+            )
+            if not transient or attempt == max_attempts:
+                break
+            time.sleep(2 * attempt)  # 2s, then 4s between retries
+ 
+    raise ValueError(
+        "Gemini is temporarily unavailable (the model is experiencing high demand). "
+        "Please wait a moment and click Analyze Resume again."
+    ) from last_error
+ 
+ 
 # -----------------------------
 # User interface
 # -----------------------------
@@ -240,28 +289,28 @@ uploaded_file = st.file_uploader(
     type=["pdf", "docx"],
     help="PDF or DOCX only.",
 )
-
+ 
 job_description = st.text_area(
     "Job Description (optional)",
     height=220,
     placeholder="Paste the job description here for a more accurate ATS match.",
 )
-
+ 
 analyze_button = st.button(
     "🔍 Analyze Resume",
     type="primary",
     use_container_width=True,
 )
-
+ 
 if analyze_button:
     if uploaded_file is None:
         st.warning("Please upload a PDF or DOCX resume first.")
         st.stop()
-
+ 
     try:
         with st.spinner("Reading your resume..."):
             resume_text = extract_resume_text(uploaded_file)
-
+ 
         if len(resume_text.strip()) < 100:
             st.error(
                 "Very little text could be extracted from this file. "
@@ -269,21 +318,21 @@ if analyze_button:
                 "PDF or DOCX version."
             )
             st.stop()
-
+ 
         # Prevent unnecessarily huge prompts.
         resume_text = resume_text[:50000]
         job_description = job_description[:30000]
-
+ 
         with st.spinner("Gemini is analyzing your resume..."):
             result = analyze_resume(resume_text, job_description)
-
+ 
         # -----------------------------
         # Score cards
         # -----------------------------
         st.subheader("📊 ATS Results")
-
+ 
         score_cols = st.columns(5)
-
+ 
         scores = [
             ("ATS Score", result["ats_score"]),
             ("Keywords", result["keyword_score"]),
@@ -291,21 +340,21 @@ if analyze_button:
             ("Sections", result["section_score"]),
             ("Experience", result["experience_score"]),
         ]
-
+ 
         for col, (label, value) in zip(score_cols, scores):
             with col:
                 st.metric(label, f"{clean_score(value)}/100")
-
+ 
         st.progress(clean_score(result["ats_score"]) / 100)
-
+ 
         st.subheader("📝 Overall Assessment")
         st.write(result["summary"])
-
+ 
         # -----------------------------
         # Keywords
         # -----------------------------
         col1, col2 = st.columns(2)
-
+ 
         with col1:
             st.subheader("✅ Matched Keywords")
             matched = result.get("matched_keywords", [])
@@ -314,7 +363,7 @@ if analyze_button:
                     st.write(f"• {item}")
             else:
                 st.info("No important matched keywords were identified.")
-
+ 
         with col2:
             st.subheader("⚠️ Missing Keywords")
             missing = result.get("missing_keywords", [])
@@ -323,35 +372,35 @@ if analyze_button:
                     st.write(f"• {item}")
             else:
                 st.success("No major missing keywords were identified.")
-
+ 
         # -----------------------------
         # Strengths & improvements
         # -----------------------------
         col1, col2 = st.columns(2)
-
+ 
         with col1:
             st.subheader("💪 Strengths")
             for item in result.get("strengths", []):
                 st.write(f"• {item}")
-
+ 
         with col2:
             st.subheader("🚀 Improvements")
             for item in result.get("improvements", []):
                 st.write(f"• {item}")
-
+ 
         # -----------------------------
         # Formatting warnings
         # -----------------------------
         st.subheader("📐 ATS Formatting Warnings")
-
+ 
         warnings = result.get("formatting_warnings", [])
-
+ 
         if warnings:
             for warning in warnings:
                 st.warning(warning)
         else:
             st.success("No major ATS formatting problems were identified.")
-
+ 
         # -----------------------------
         # Simple downloadable report
         # -----------------------------
@@ -368,7 +417,7 @@ if analyze_button:
             "Improvements": result.get("improvements", []),
             "Formatting Warnings": result.get("formatting_warnings", []),
         }
-
+ 
         st.download_button(
             "⬇️ Download Analysis",
             data=json.dumps(report, indent=2),
@@ -376,7 +425,7 @@ if analyze_button:
             mime="application/json",
             use_container_width=True,
         )
-
+ 
     except Exception as error:
         st.error("The resume could not be analyzed.")
         st.exception(error)
